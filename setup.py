@@ -552,6 +552,7 @@ def get_common_options(build_ext):
                'horovod/common/mpi_context.cc',
                'horovod/common/operations.cc',
                'horovod/common/parameter_manager.cc',
+               'horovod/common/response_cache.cc',
                'horovod/common/timeline.cc',
                'horovod/common/ops/collective_operations.cc',
                'horovod/common/ops/mpi_operations.cc',
@@ -649,9 +650,9 @@ def is_mx_mkldnn():
         msg = 'INFO: Cannot detect if MKLDNN is enabled in MXNet. Please \
             set MXNET_USE_MKLDNN=1 if MKLDNN is enabled in your MXNet build.'
         if 'linux' not in sys.platform:
-            # MKLDNN is only enabled by default in MXNet Linux build. Return 
-            # False by default for non-linux build but still allow users to 
-            # enable it by using MXNET_USE_MKLDNN env variable. 
+            # MKLDNN is only enabled by default in MXNet Linux build. Return
+            # False by default for non-linux build but still allow users to
+            # enable it by using MXNET_USE_MKLDNN env variable.
             print(msg)
             return os.environ.get('MXNET_USE_MKLDNN', '0') == '1'
         else:
@@ -720,7 +721,7 @@ def build_mx_extension(build_ext, options):
     if is_mx_mkldnn():
         mxnet_mpi_lib.define_macros += [('MXNET_USE_MKLDNN', '1')]
     else:
-        mxnet_mpi_lib.define_macros += [('MXNET_USE_MKLDNN', '0')]    
+        mxnet_mpi_lib.define_macros += [('MXNET_USE_MKLDNN', '0')]
     mxnet_mpi_lib.define_macros += [('MSHADOW_USE_MKL', '0')]
     mxnet_mpi_lib.include_dirs = options['INCLUDES']
     mxnet_mpi_lib.sources = options['SOURCES'] + \
@@ -986,14 +987,18 @@ class custom_build_ext(build_ext):
             raise DistutilsError(
                 'None of TensorFlow, PyTorch, or MXNet plugins were built. See errors above.')
 
+require_list = ['cloudpickle', 'psutil', 'six']
+# Skip cffi if pytorch extension explicitly disabled
+if not os.environ.get('HOROVOD_WITHOUT_PYTORCH'):
+  require_list.append('cffi>=1.4.0')
 
 setup(name='horovod',
       version=__version__,
       packages=find_packages(),
-      description='Distributed training framework for TensorFlow, Keras, PyTorch, and MXNet.',
-      author='Uber Technologies, Inc.',
+      description='Distributed training framework for TensorFlow, Keras, PyTorch, and Apache MXNet.',
+      author='The Horovod Authors',
       long_description=textwrap.dedent('''\
-          Horovod is a distributed training framework for TensorFlow, Keras, PyTorch, and MXNet.
+          Horovod is a distributed training framework for TensorFlow, Keras, PyTorch, and Apache MXNet.
           The goal of Horovod is to make distributed Deep Learning fast and easy to use.'''),
       url='https://github.com/uber/horovod',
       classifiers=[
@@ -1006,7 +1011,7 @@ setup(name='horovod',
       # If cffi is specified in setup_requires, it will need libffi to be installed on the machine,
       # which is undesirable.  Luckily, `install` action will install cffi before executing build,
       # so it's only necessary for `build*` or `bdist*` actions.
-      setup_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'] if is_build_action() else [],
-      install_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'],
+      setup_requires=require_list if is_build_action() else [],
+      install_requires=require_list,
       zip_safe=False,
       scripts=['bin/horovodrun'])

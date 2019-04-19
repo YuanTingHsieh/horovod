@@ -1,4 +1,4 @@
-CS744 final project setup script
+# CS744 final project setup script
 
 # First open an experiment in cloudlab
 
