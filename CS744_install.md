@@ -19,10 +19,19 @@ python3 -m pip install tensorflow
 #sudo -H python3 -m pip install horovod
 python3 -m pip install horovod
 
-git clone https://github.com/horovod/horovod.git
+#git clone https://github.com/horovod/horovod.git
+
+# to build horovod from source
+git clone --recursive https://github.com/YuanTingHsieh/horovod.git
+cd horovod
+python3 setup.py sdist
+python3 -m pip install dist/horovod*.tar.gz
+# remember to modify bin/horovodrun first line python to python3
+chmod 777 bin/horovodrun
+cd ../
 
 # be sure to gen sshkey and copy it inside cloud lab
 # and make sure each node can ssh to one another
 
 # to run
-hordovodrun -np 4 -H node0:1,node1:1,node2:1,node3:1 python3 horovod/examples/tensorflow_mnist.py
+./horovod/bin/hordovodrun -np 3 -H node0:1,node1:1,node2:1 python3 ./horovod/examples/tensorflow_mnist.py
