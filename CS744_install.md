@@ -22,6 +22,8 @@ python3 -m pip install horovod
 #git clone https://github.com/horovod/horovod.git
 
 # to build horovod from source
+# to build for tensorflow is as below
+# to build for pytorch need to add flag HOROVOD_WITH_PYTORCH=1 in front of python3
 git clone --recursive https://github.com/YuanTingHsieh/horovod.git
 cd horovod
 python3 setup.py sdist
