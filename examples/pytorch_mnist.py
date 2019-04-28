@@ -6,6 +6,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 import torch.utils.data.distributed
 import horovod.torch as hvd
+import tensorboardX
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -27,8 +28,26 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--fp16-allreduce', action='store_true', default=False,
                     help='use fp16 compression during allreduce')
+
+# ---- args added by jack and yuan
+# for some reason, new args aren't working quite right
+parser.add_argument('--loadcp', action='store_true', default=False,
+                    help='whether or not to try to load a checkpoint before starting training')
+parser.add_argument('--log-dir', default='./logs',
+                    help='tensorboard log directory')
+parser.add_argument('--checkpoint-format', default='./checkpoint-{epoch}.pth.tar',
+                    help='checkpoint file format')
+
+parser.add_argument('--batches-per-allreduce', type=int, default=1,
+                     help='number of batches processed locally before '
+                          'executing allreduce across workers; it multiplies '
+                          'total batch size.')
+
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+
+# yuan add
+allreduce_batch_size = args.batch_size * args.batches_per_allreduce
 
 # Horovod: initialize library.
 hvd.init()
@@ -91,48 +110,10 @@ if args.cuda:
     model.cuda()
 
 # Horovod: scale learning rate by the number of GPUs.
-optimizer = optim.SGD(model.parameters(), lr=args.lr * hvd.size(),
+optimizer = optim.SGD(model.parameters(),
+                      lr=(args.lr * args.batches_per_allreduce *
+                          hvd.size()),
                       momentum=args.momentum)
-
-# Horovod: broadcast parameters & optimizer state.
-hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
-# Horovod: (optional) compression algorithm.
-compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
-
-# Horovod: wrap optimizer with DistributedOptimizer.
-optimizer = hvd.DistributedOptimizer(optimizer,
-                                     named_parameters=model.named_parameters(),
-                                     compression=compression)
-
-
-def train(epoch):
-    model.train()
-    # Horovod: set epoch to sampler for shuffling.
-    train_sampler.set_epoch(epoch)
-    for batch_idx, (data, target) in enumerate(train_loader):
-        if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        if batch_idx % args.log_interval == 0:
-            # Horovod: use train_sampler to determine the number of examples in
-            # this worker's partition.
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_sampler),
-                100. * batch_idx / len(train_loader), loss.item()))
-
-
-def metric_average(val, name):
-    tensor = torch.tensor(val)
-    avg_tensor = hvd.allreduce(tensor, name=name)
-    return avg_tensor.item()
-
-
 def test():
     model.eval()
     test_loss = 0.
@@ -162,6 +143,87 @@ def test():
             test_loss, 100. * test_accuracy))
 
 
-for epoch in range(1, args.epochs + 1):
+# Horovod: write TensorBoard logs on first worker
+log_writer = tensorboardX.SummaryWriter(args.log_dir) if hvd.rank() == 0 else None
+
+# Horovod: (optional) compression algorithm.
+compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
+
+# Horovod: wrap optimizer with DistributedOptimizer.
+optimizer = hvd.DistributedOptimizer(
+    optimizer,
+    named_parameters=model.named_parameters(),
+    compression=compression,
+    backward_passes_per_step=args.batches_per_allreduce)
+
+resume_from_epoch = 0
+#try to load an existing model if it exists
+if args.loadcp and hvd.rank() == 0:
+    try:
+        checkpoint = torch.load('saved_model.pt')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        resume_from_epoch = checkpoint['epoch']
+        loss = checkpoint['loss']
+        print("resuming training from epoch " + str(resume_from_epoch))
+
+    except:
+       print("no saved model found")
+
+# Horovod: broadcast parameters & optimizer state.
+hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+print("before broadcast epoch")
+
+# Horovod: broadcast resume_from_epoch from rank 0 (which will have ckpts)
+# to other ranks
+resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
+                                  name='resume_from_epoch').item()
+print("after broadcast epoch", resume_from_epoch)
+
+def train(epoch):
+    model.train()
+    # Horovod: set epoch to sampler for shuffling.
+    train_sampler.set_epoch(epoch)
+    for batch_idx, (data, target) in enumerate(train_loader):
+        if args.cuda:
+            data, target = data.cuda(), target.cuda()
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.nll_loss(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % args.log_interval == 0:
+            # Horovod: use train_sampler to determine the number of examples in
+            # this worker's partition.
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_sampler),
+                100. * batch_idx / len(train_loader), loss.item()))
+        
+    #save the model after some number of epochs
+    if epoch == 2 and hvd.rank() == 0:
+        print("Saving model...")
+        save_model(epoch, loss)
+
+
+def metric_average(val, name):
+    tensor = torch.tensor(val)
+    avg_tensor = hvd.allreduce(tensor, name=name)
+    return avg_tensor.item()
+
+def save_model(epoch, loss):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss
+    }, 'saved_model.pt')
+
+if resume_from_epoch > 0:
+    test()
+
+for epoch in range(resume_from_epoch, args.epochs + 1):
     train(epoch)
     test()
+
