@@ -7,6 +7,7 @@ from torchvision import datasets, transforms
 import torch.utils.data.distributed
 import horovod.torch as hvd
 import tensorboardX
+import math
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -70,7 +71,7 @@ train_dataset = \
 train_sampler = torch.utils.data.distributed.DistributedSampler(
     train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
 train_loader = torch.utils.data.DataLoader(
-    train_dataset, batch_size=args.batch_size, sampler=train_sampler, **kwargs)
+    train_dataset, batch_size=allreduce_batch_size, sampler=train_sampler, **kwargs)
 
 test_dataset = \
     datasets.MNIST('data-%d' % hvd.rank(), train=False, transform=transforms.Compose([
@@ -114,34 +115,10 @@ optimizer = optim.SGD(model.parameters(),
                       lr=(args.lr * args.batches_per_allreduce *
                           hvd.size()),
                       momentum=args.momentum)
-def test():
-    model.eval()
-    test_loss = 0.
-    test_accuracy = 0.
-    for data, target in test_loader:
-        if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        output = model(data)
-        # sum up batch loss
-        test_loss += F.nll_loss(output, target, size_average=False).item()
-        # get the index of the max log-probability
-        pred = output.data.max(1, keepdim=True)[1]
-        test_accuracy += pred.eq(target.data.view_as(pred)).cpu().float().sum()
 
-    # Horovod: use test_sampler to determine the number of examples in
-    # this worker's partition.
-    test_loss /= len(test_sampler)
-    test_accuracy /= len(test_sampler)
-
-    # Horovod: average metric values across workers.
-    test_loss = metric_average(test_loss, 'avg_loss')
-    test_accuracy = metric_average(test_accuracy, 'avg_accuracy')
-
-    # Horovod: print output only on first rank.
-    if hvd.rank() == 0:
-        print('\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n'.format(
-            test_loss, 100. * test_accuracy))
-
+for name, p in model.named_parameters():
+    print(name)
+    print(p.data.size())
 
 # Horovod: write TensorBoard logs on first worker
 log_writer = tensorboardX.SummaryWriter(args.log_dir) if hvd.rank() == 0 else None
@@ -175,55 +152,103 @@ hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
 print("before broadcast epoch")
-
 # Horovod: broadcast resume_from_epoch from rank 0 (which will have ckpts)
 # to other ranks
 resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
                                   name='resume_from_epoch').item()
 print("after broadcast epoch", resume_from_epoch)
 
+def test():
+    model.eval()
+    test_loss = Metric('test_loss')
+    test_accuracy = Metric('test_accuracy')
+    for data, target in test_loader:
+        if args.cuda:
+            data, target = data.cuda(), target.cuda()
+        output = model(data)
+        test_loss.update(F.cross_entropy(output, target))
+        # sum up batch loss
+        # get the index of the max log-probability
+        pred = output.data.max(1, keepdim=True)[1]
+        test_accuracy.update(accuracy(output, target))
+
+    # Horovod: print output only on first rank.
+    if hvd.rank() == 0:
+        print('\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n'.format(
+            test_loss.avg.item(), 100. * test_accuracy.avg.item()))
+
 def train(epoch):
     model.train()
     # Horovod: set epoch to sampler for shuffling.
     train_sampler.set_epoch(epoch)
+    train_loss = Metric('train_loss')
+    train_accuracy = Metric('train_accuracy')
+
     for batch_idx, (data, target) in enumerate(train_loader):
         if args.cuda:
             data, target = data.cuda(), target.cuda()
         optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
+        # split data into sub-batches of size batch_size
+        # we are now of allreduce_batch_size
+        for i in range(0, len(data), args.batch_size):
+            data_batch = data[i:i + args.batch_size]
+            target_batch = target[i:i + args.batch_size]
+            output = model(data_batch)
+            train_accuracy.update(accuracy(output, target_batch))
+            loss = F.nll_loss(output, target_batch)
+            train_loss.update(loss)
+            # average gradients among sub-batches
+            loss.div_(math.ceil(float(len(data)) / args.batch_size))
+            loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             # Horovod: use train_sampler to determine the number of examples in
             # this worker's partition.
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.2f}'.format(
                 epoch, batch_idx * len(data), len(train_sampler),
-                100. * batch_idx / len(train_loader), loss.item()))
+                100. * batch_idx / len(train_loader),
+                train_loss.avg.item(), train_accuracy.avg.item()))
         
     #save the model after some number of epochs
     if epoch == 2 and hvd.rank() == 0:
         print("Saving model...")
         save_model(epoch, loss)
 
+# Horovod: average metrics from distributed training.
+class Metric(object):
+    def __init__(self, name):
+        self.name = name
+        self.sum = torch.tensor(0.)
+        self.n = torch.tensor(0.)
 
-def metric_average(val, name):
-    tensor = torch.tensor(val)
-    avg_tensor = hvd.allreduce(tensor, name=name)
-    return avg_tensor.item()
+    def update(self, val):
+        self.sum += hvd.allreduce(val.detach().cpu(), name=self.name)
+        self.n += 1
 
+    @property
+    def avg(self):
+        return self.sum / self.n
+
+def accuracy(output, target):
+    # get the index of the max log-probability
+    pred = output.max(1, keepdim=True)[1]
+    return pred.eq(target.view_as(pred)).cpu().float().mean()
+
+#def save_model(epoch, loss, batch_size, backward_passes_per_step):
 def save_model(epoch, loss):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss
+        'loss': loss,
+#        'batch_size': batch_size,
+#        'backward_passes_per_step': backward_passes_per_step
     }, 'saved_model.pt')
 
 if resume_from_epoch > 0:
     test()
 
-for epoch in range(resume_from_epoch, args.epochs + 1):
+for epoch in range(resume_from_epoch+1, args.epochs + 1):
     train(epoch)
     test()
 
