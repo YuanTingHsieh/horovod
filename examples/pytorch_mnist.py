@@ -158,35 +158,54 @@ resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
                                   name='resume_from_epoch').item()
 print("after broadcast epoch", resume_from_epoch)
 
+def metric_average(val, name):
+    tensor = torch.tensor(val)
+    avg_tensor = hvd.allreduce(tensor, name=name)
+    return avg_tensor.item()
+
 def test():
     model.eval()
-    test_loss = Metric('test_loss')
-    test_accuracy = Metric('test_accuracy')
+    test_loss = 0.
+    test_accuracy = 0.
     for data, target in test_loader:
         if args.cuda:
             data, target = data.cuda(), target.cuda()
         output = model(data)
-        test_loss.update(F.cross_entropy(output, target))
         # sum up batch loss
         # get the index of the max log-probability
+        test_loss += F.nll_loss(output, target, size_average=False).item()
+        # get the index of the max log-probability
         pred = output.data.max(1, keepdim=True)[1]
-        test_accuracy.update(accuracy(output, target))
+        test_accuracy += pred.eq(target.data.view_as(pred)).cpu().float().sum()
+
+    # Horovod: use test_sampler to determine the number of examples in
+    # this worker's partition.
+    test_loss /= len(test_sampler)
+    test_accuracy /= len(test_sampler)
+
+    # Horovod: average metric values across workers.
+    test_loss = metric_average(test_loss, 'avg_loss')
+    test_accuracy = metric_average(test_accuracy, 'avg_accuracy')
 
     # Horovod: print output only on first rank.
     if hvd.rank() == 0:
+    #if True:
         print('\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n'.format(
-            test_loss.avg.item(), 100. * test_accuracy.avg.item()))
+            test_loss, 100. * test_accuracy))
 
 def train(epoch):
     model.train()
     # Horovod: set epoch to sampler for shuffling.
     train_sampler.set_epoch(epoch)
-    train_loss = Metric('train_loss')
-    train_accuracy = Metric('train_accuracy')
 
     for batch_idx, (data, target) in enumerate(train_loader):
+        # loss and accuracy for each batch
+        train_batch_loss = 0.
+        train_batch_accuracy = 0.
+
         if args.cuda:
             data, target = data.cuda(), target.cuda()
+
         optimizer.zero_grad()
         # split data into sub-batches of size batch_size
         # we are now of allreduce_batch_size
@@ -194,40 +213,32 @@ def train(epoch):
             data_batch = data[i:i + args.batch_size]
             target_batch = target[i:i + args.batch_size]
             output = model(data_batch)
-            train_accuracy.update(accuracy(output, target_batch))
+            #train_accuracy.update(accuracy(output, target_batch))
             loss = F.nll_loss(output, target_batch)
-            train_loss.update(loss)
             # average gradients among sub-batches
             loss.div_(math.ceil(float(len(data)) / args.batch_size))
             loss.backward()
+
+        bigoutput = model(data)
+
+        train_batch_loss = F.nll_loss(bigoutput, target).item()
+        train_batch_accuracy = accuracy(bigoutput, target)
+        train_batch_loss = metric_average(train_batch_loss, 'avg_train_batch_loss')
+        train_batch_accuracy = metric_average(train_batch_accuracy, 'avg_train_batch_accuracy')
         optimizer.step()
-        if batch_idx % args.log_interval == 0:
+
+        if hvd.rank() == 0 and batch_idx % args.log_interval == 0:
             # Horovod: use train_sampler to determine the number of examples in
             # this worker's partition.
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.2f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tBatch Loss: {:.6f}, Batch Accuracy: {:.2f}'.format(
                 epoch, batch_idx * len(data), len(train_sampler),
                 100. * batch_idx / len(train_loader),
-                train_loss.avg.item(), train_accuracy.avg.item()))
+                train_batch_loss, train_batch_accuracy))
         
     #save the model after some number of epochs
     if epoch == 2 and hvd.rank() == 0:
         print("Saving model...")
         save_model(epoch, loss)
-
-# Horovod: average metrics from distributed training.
-class Metric(object):
-    def __init__(self, name):
-        self.name = name
-        self.sum = torch.tensor(0.)
-        self.n = torch.tensor(0.)
-
-    def update(self, val):
-        self.sum += hvd.allreduce(val.detach().cpu(), name=self.name)
-        self.n += 1
-
-    @property
-    def avg(self):
-        return self.sum / self.n
 
 def accuracy(output, target):
     # get the index of the max log-probability
