@@ -11,10 +11,10 @@ import math
 import time
 import sys
 
-delete_old_plots = True
-plot_name = "no_agg1"
+delete_old_plots = False
+plot_name = "agg_18->3"
 local_hostname = "10.141.88.211"  #this is the hostname for my local machine
-plot_interval = 10 #record accuracy and loss every X batches
+plot_interval = 18 #record accuracy and loss every X batches
 
 #for using tensorboard with pytorch
 from pycrayon import CrayonClient
@@ -149,7 +149,7 @@ if args.cuda:
 
 # Horovod: scale learning rate by the number of GPUs.
 optimizer = optim.SGD(model.parameters(),
-                      lr=(args.lr * args.batches_per_allreduce * 
+                      lr=(args.lr * 
                           hvd.size()),
                       momentum=args.momentum)
 
@@ -269,7 +269,6 @@ def train(epoch):
             loss.backward()
 
         bigoutput = model(data)
-
         train_batch_loss = F.nll_loss(bigoutput, target).item()
         train_batch_accuracy = accuracy(bigoutput, target)
         train_batch_loss = metric_average(train_batch_loss, 'avg_train_batch_loss')
@@ -277,6 +276,7 @@ def train(epoch):
         
         optimizer.step()
 
+        #if hvd.rank() == 0 and batch_idx % (plot_interval / args.batches_per_allreduce) == 0:
         if hvd.rank() == 0 and batch_idx % plot_interval == 0:   
             exp.add_scalar_value("loss", train_batch_loss, time.time()-start_time)
             exp.add_scalar_value("accuracy", train_batch_accuracy, time.time()-start_time)
@@ -292,7 +292,7 @@ def train(epoch):
                 train_batch_loss, train_batch_accuracy))
         
     #save the model after some number of epochs
-    if epoch == 15 and hvd.rank() == 0:
+    if epoch == 1 and hvd.rank() == 0:
         print("Saving model...")
         save_model(epoch, loss)
 
@@ -318,8 +318,6 @@ if resume_from_epoch > 0:
     test()
 
 for epoch in range(resume_from_epoch+1, args.epochs + 1):
-    if epoch > 15:
-        break
     train(epoch)
     test()
 

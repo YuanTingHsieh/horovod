@@ -13,14 +13,28 @@ import random
 #not sure how that would work with multithreading though, need to look into it
 host_lst = None
 cpu_lst = None
+starting_total_resources = 0
 horovod_proc = None
 jobfile = None
 times_started = 0 #used for logging filename
 restarting = False
 
-aliases = {"10.10.1.2":"node1", "10.10.1.3":"node2", "127.0.0.1":"node0"}
+aliases = {"10.10.1.2":"node1", "10.10.1.3":"node2", "127.0.0.1":"node0", "10.10.1.1":"node0"}
 ports = [5000, 5001, 5002] #in case we just ran and port not ready yet, provide some backup ports
 
+
+def updateResources(num_removed):
+
+    global cpu_lst
+    while(num_removed > 0 and sum(cpu_lst) > 0):
+        for index in range(len(cpu_lst)):
+            if cpu_lst[index] > 0:
+                cpu_lst[index] -= 1
+        num_removed -= 1
+    if sum(cpu_lst) == 0:
+        return False
+    else:
+        return True
 
 #removes more resources until we get an even batches-per-allreduce
 def removeAdditionalResources(old_total):
@@ -30,14 +44,26 @@ def removeAdditionalResources(old_total):
     
     #this loop runs once for each additional resource to remove
     while(sum(cpu_lst) > 0 and old_total % sum(cpu_lst) != 0):
-
         #take from a random machine for fairness purposes
         #but who really cares
-        host_ind = random.randint(0, len(host_lst)-1)
-        cpu_lst[host_ind] -= 1
-        if cpu_lst[host_ind] <= 0:
+
+        #TODO: remove evenly from machines for evaluation
+        max_ = -1
+        max_ind = -1
+        for index in range(len(host_lst)):
+            if cpu_lst[index] > max_:
+                max_ = cpu_lst[index]
+                max_ind = index
+        cpu_lst[max_ind] -= 1
+        if cpu_lst[max_ind] <= 0:
             cpu_lst.pop(host_ind)
             host_lst.pop(host_ind)
+        
+        # host_ind = random.randint(0, len(host_lst)-1)
+        # cpu_lst[host_ind] -= 1
+        # if cpu_lst[host_ind] <= 0:
+        #     cpu_lst.pop(host_ind)
+        #     host_lst.pop(host_ind)
 
     #if we've removed all resources, we weren't able to get a good allocation
     if sum(cpu_lst) <= 0:
@@ -92,6 +118,7 @@ def listener():
     global ports
     global aliases
     global restarting
+    global starting_total_resources
 
     s = socket.socket()
     success = False
@@ -122,41 +149,55 @@ def listener():
             conn.close()
             continue
 
-        old_total_resources = sum(cpu_lst)
-        for index in range(len(host_lst)):
-            if aliases[str(addr[0])] == host_lst[index]:
-                cpu_lst[index] = max(0, cpu_lst[index] - msg)
+        # for index in range(len(host_lst)):
+        #     if aliases[str(addr[0])] == host_lst[index]:
+        #         cpu_lst[index] = max(0, cpu_lst[index] - msg)
 
-                #if # cpus is 0, remove the machine entirely
-                if cpu_lst[index] == 0:
-                    cpu_lst.pop(index)
-                    host_lst.pop(index)
+        #         #if # cpus is 0, remove the machine entirely
+        #         if cpu_lst[index] == 0:
+        #             cpu_lst.pop(index)
+        #             host_lst.pop(index)
                     
-                break
+        #         break
+
+        succeeded = updateResources(msg)
+        new_total_resources = sum(cpu_lst)
+        if starting_total_resources % new_total_resources != 0:
+            succeeded = removeAdditionalResources(starting_total_resources)
+        
+        new_total_resources = sum(cpu_lst)
             
         restarting = True
-        new_total_resources = sum(cpu_lst)
+        if not succeeded:
+            print("ERROR: resource request results in a bad allocation of resources. Exiting...")
+            exit(0)
+        else:
+            print("INFO: Resource update request received from " + str(addr[0]) + \
+              "\n\tCPUs reduced from " + str(starting_total_resources) + "->" + \
+              str(new_total_resources) + "\n\tUpdated batches-per-allreduce: " + \
+              str(starting_total_resources/new_total_resources))
+
         revoked_resources = False
 
-        if old_total_resources % new_total_resources != 0:
-            revoked_resources = removeAdditionalResources(old_total_resources)
-            if not revoked_resources:
-                print("ERROR: change in resource profile requested by " + str(addr[0]) + " doesn't result in a whole number " +
-                      "for batches-per-allreduce. Exiting..")
-                exit(0)
-            new_total_resources = sum(cpu_lst)
+        # if starting_total_resources % new_total_resources != 0:
+        #     revoked_resources = removeAdditionalResources(starting_total_resources)
+        #     if not revoked_resources:
+        #         print("ERROR: change in resource profile requested by " + str(addr[0]) + " doesn't result in a whole number " +
+        #               "for batches-per-allreduce. Exiting..")
+        #         exit(0)
+        #     new_total_resources = sum(cpu_lst)
 
-        if revoked_resources:
-            print("INFO: Had to revoke additional resources to satisfy the request from client.")
+        # if revoked_resources:
+        #     print("INFO: Had to revoke additional resources to satisfy the request from client.")
             
-        print("INFO: Resource update request received from " + str(addr[0]) + \
-              "\n\tCPUs reduced from " + str(old_total_resources) + "->" + \
-              str(new_total_resources) + "\n\tUpdated batches-per-allreduce: " + \
-              str(old_total_resources/new_total_resources))
+        # print("INFO: Resource update request received from " + str(addr[0]) + \
+        #       "\n\tCPUs reduced from " + str(starting_total_resources) + "->" + \
+        #       str(new_total_resources) + "\n\tUpdated batches-per-allreduce: " + \
+        #       str(starting_total_resources/new_total_resources))
             
         
         killHorovod()
-        startHorovod(formHorovodCommand(host_lst, cpu_lst, jobfile, old_total_resources/new_total_resources, args.epochs))
+        startHorovod(formHorovodCommand(host_lst, cpu_lst, jobfile, starting_total_resources/new_total_resources, args.epochs))
         restarting = False
         conn.close()
 
@@ -182,6 +223,8 @@ if len(host_lst) != len(cpu_lst):
           " --hosts [host1, ...] --cpus [#cpus1, ...] --jobfile path-to-file.py")
     exit(0)
 
+starting_total_resources = sum(cpu_lst)
+    
 #save logfiles
 logging.basicConfig(filename="log.out")
 x = threading.Thread(target=listener)
