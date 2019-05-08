@@ -8,6 +8,16 @@ import torch.utils.data.distributed
 import horovod.torch as hvd
 import tensorboardX
 import math
+import time
+import sys
+
+delete_old_plots = True
+plot_name = "no_agg1"
+local_hostname = "10.141.88.211"  #this is the hostname for my local machine
+plot_interval = 10 #record accuracy and loss every X batches
+
+#for using tensorboard with pytorch
+from pycrayon import CrayonClient
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -34,6 +44,7 @@ parser.add_argument('--fp16-allreduce', action='store_true', default=False,
 # for some reason, new args aren't working quite right
 parser.add_argument('--loadcp', action='store_true', default=False,
                     help='whether or not to try to load a checkpoint before starting training')
+parser.add_argument('--cp-dir', default="./", help='path to checkpoints')
 parser.add_argument('--log-dir', default='./logs',
                     help='tensorboard log directory')
 parser.add_argument('--checkpoint-format', default='./checkpoint-{epoch}.pth.tar',
@@ -54,6 +65,31 @@ allreduce_batch_size = args.batch_size * args.batches_per_allreduce
 hvd.init()
 torch.manual_seed(args.seed)
 
+#init crayon for tensorboard
+
+if hvd.rank() == 0:    
+    print("Connecting to the Crayon client...", end="")
+    sys.stdout.flush()
+    cc = CrayonClient(hostname=local_hostname, port="8889")
+    print("success!")
+    sys.stdout.flush()
+    
+    if delete_old_plots:
+        for plot in cc.get_experiment_names():
+            try:
+                cc.remove_experiment(plot)
+            except:
+                pass
+    
+    try:
+        cc.remove_experiment(plot_name)
+    except:
+        pass
+    
+    exp = cc.create_experiment(plot_name)
+    start_time = None
+
+
 if args.cuda:
     # Horovod: pin GPU to local rank.
     torch.cuda.set_device(hvd.local_rank())
@@ -67,12 +103,13 @@ train_dataset = \
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,))
                    ]))
+#train_dataset = torch.utils.data.Subset(train_dataset, [i for i in range(2304)])
+#train_dataset = torch.utils.data.TensorDataset(torch.arange(0, 36, 1), torch.arange(0, 36, 1))
 # Horovod: use DistributedSampler to partition the training data.
 train_sampler = torch.utils.data.distributed.DistributedSampler(
     train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
 train_loader = torch.utils.data.DataLoader(
     train_dataset, batch_size=allreduce_batch_size, sampler=train_sampler, **kwargs)
-
 test_dataset = \
     datasets.MNIST('data-%d' % hvd.rank(), train=False, transform=transforms.Compose([
         transforms.ToTensor(),
@@ -112,13 +149,13 @@ if args.cuda:
 
 # Horovod: scale learning rate by the number of GPUs.
 optimizer = optim.SGD(model.parameters(),
-                      lr=(args.lr * args.batches_per_allreduce *
+                      lr=(args.lr * args.batches_per_allreduce * 
                           hvd.size()),
                       momentum=args.momentum)
 
-for name, p in model.named_parameters():
-    print(name)
-    print(p.data.size())
+# for name, p in model.named_parameters():
+#     print(name)
+#     print(p.data.size())
 
 # Horovod: write TensorBoard logs on first worker
 log_writer = tensorboardX.SummaryWriter(args.log_dir) if hvd.rank() == 0 else None
@@ -137,7 +174,7 @@ resume_from_epoch = 0
 #try to load an existing model if it exists
 if args.loadcp and hvd.rank() == 0:
     try:
-        checkpoint = torch.load('saved_model.pt')
+        checkpoint = torch.load(args.cp_dir + 'saved_model.pt')
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         resume_from_epoch = checkpoint['epoch']
@@ -151,12 +188,10 @@ if args.loadcp and hvd.rank() == 0:
 hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
-print("before broadcast epoch")
 # Horovod: broadcast resume_from_epoch from rank 0 (which will have ckpts)
 # to other ranks
 resume_from_epoch = hvd.broadcast(torch.tensor(resume_from_epoch), root_rank=0,
                                   name='resume_from_epoch').item()
-print("after broadcast epoch", resume_from_epoch)
 
 def metric_average(val, name):
     tensor = torch.tensor(val)
@@ -164,6 +199,10 @@ def metric_average(val, name):
     return avg_tensor.item()
 
 def test():
+
+    global exp
+    global start_time
+    
     model.eval()
     test_loss = 0.
     test_accuracy = 0.
@@ -189,16 +228,26 @@ def test():
 
     # Horovod: print output only on first rank.
     if hvd.rank() == 0:
-    #if True:
+
+        #Jack add: TensorBoard
+        #exp.add_scalar_value("loss", test_loss, time.time()-start_time)
+        #exp.add_scalar_value("accuracy", test_accuracy, time.time()-start_time)
+        
         print('\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n'.format(
             test_loss, 100. * test_accuracy))
 
 def train(epoch):
+
+    #global exp
+    global start_time
+    global plot_interval
+    
     model.train()
     # Horovod: set epoch to sampler for shuffling.
     train_sampler.set_epoch(epoch)
 
     for batch_idx, (data, target) in enumerate(train_loader):
+        
         # loss and accuracy for each batch
         train_batch_loss = 0.
         train_batch_accuracy = 0.
@@ -225,23 +274,30 @@ def train(epoch):
         train_batch_accuracy = accuracy(bigoutput, target)
         train_batch_loss = metric_average(train_batch_loss, 'avg_train_batch_loss')
         train_batch_accuracy = metric_average(train_batch_accuracy, 'avg_train_batch_accuracy')
+        
         optimizer.step()
+
+        if hvd.rank() == 0 and batch_idx % plot_interval == 0:   
+            exp.add_scalar_value("loss", train_batch_loss, time.time()-start_time)
+            exp.add_scalar_value("accuracy", train_batch_accuracy, time.time()-start_time)
+            
 
         if hvd.rank() == 0 and batch_idx % args.log_interval == 0:
             # Horovod: use train_sampler to determine the number of examples in
             # this worker's partition.
+            
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tBatch Loss: {:.6f}, Batch Accuracy: {:.2f}'.format(
                 epoch, batch_idx * len(data), len(train_sampler),
                 100. * batch_idx / len(train_loader),
                 train_batch_loss, train_batch_accuracy))
         
     #save the model after some number of epochs
-    if epoch == 2 and hvd.rank() == 0:
+    if epoch == 15 and hvd.rank() == 0:
         print("Saving model...")
         save_model(epoch, loss)
 
 def accuracy(output, target):
-    # get the index of the max log-probability
+    #get the index of the max log-probability
     pred = output.max(1, keepdim=True)[1]
     return pred.eq(target.view_as(pred)).cpu().float().mean()
 
@@ -256,10 +312,15 @@ def save_model(epoch, loss):
 #        'backward_passes_per_step': backward_passes_per_step
     }, 'saved_model.pt')
 
+start_time = time.time()
+    
 if resume_from_epoch > 0:
     test()
 
 for epoch in range(resume_from_epoch+1, args.epochs + 1):
+    if epoch > 15:
+        break
     train(epoch)
     test()
+
 
